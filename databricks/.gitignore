@@ -1,0 +1,8 @@
+.sample_data/
+.databricks/
+__pycache__/
+*.pyc
+mlruns/
+derby.log
+metastore_db/
+spark-warehouse/

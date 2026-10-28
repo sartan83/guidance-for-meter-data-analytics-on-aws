@@ -1,0 +1,36 @@
+# Databricks Asset Bundle: Meter Data Analytics (MDA) medallion pipeline on Unity Catalog.
+# Replaces the Step Functions / Glue / SageMaker orchestration of the AWS guidance.
+bundle:
+  name: mda_pipeline
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog holding the bronze/silver/gold schemas
+    default: mda_dev
+  warehouse_id:
+    description: SQL warehouse used by the voltvar_feature SQL notebook task
+  node_type_id:
+    description: Worker node type for the job clusters
+    default: i3.xlarge
+  spark_version:
+    description: Databricks Runtime for ETL tasks (Auto Loader, Delta, liquid clustering)
+    default: 15.4.x-scala2.12
+  ml_spark_version:
+    description: Databricks Runtime ML for anomaly_detection / ml_training / batch_inference
+    default: 15.4.x-cpu-ml-scala2.12
+  landing_trigger_pause_status:
+    description: File-arrival trigger on the landing volume (replaces QueueStatusStateMachine polling)
+    default: PAUSED
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production
+    variables:
+      catalog: mda_prod
+      landing_trigger_pause_status: UNPAUSED
