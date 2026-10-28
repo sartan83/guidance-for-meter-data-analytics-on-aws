@@ -1,0 +1,189 @@
+# Databricks Workflows job replacing:
+#   - QueueStatusStateMachine + StagingGlueWorkflow (meterreading.dataflow.input.demo.yaml)
+#   - MLPipelineOrchestratorStateMachine / MLPipelineModelTrainingStateMachine (mlpipeline.feature.template.yaml)
+#   - Volt-VAR SQS/Lambda chain (voltvar.feature.template.yaml)
+# SSM flags /mlpipeline/<stack>/Steps/{Anomaly,Training,Inference} -> job parameters run_* + condition tasks.
+#
+#   ingest_bronze ──> silver_transform ──┬─> anomaly_detection   (if run_anomaly == TRUE)
+#   ingest_topology ─────────────────────┼─> voltvar_feature     (SQL warehouse)
+#                                        └─> gold_aggregates ──> ml_training (if run_training == TRUE)
+#                                                           └──────────┴──> batch_inference (if run_inference == TRUE)
+resources:
+  jobs:
+    mda_pipeline:
+      name: mda-pipeline-${var.catalog}
+      description: Meter Data Analytics medallion pipeline (bronze/silver/gold on Unity Catalog)
+      max_concurrent_runs: 1
+      tags:
+        project: meter-data-analytics
+        migrated_from: aws-step-functions
+
+      trigger:
+        pause_status: ${var.landing_trigger_pause_status}
+        file_arrival:
+          url: /Volumes/${var.catalog}/bronze/landing/
+          min_time_between_triggers_seconds: 300
+          wait_after_last_change_seconds: 60
+
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: run_anomaly          # /mlpipeline/<stack>/Steps/Anomaly
+          default: "FALSE"
+        - name: run_training         # /mlpipeline/<stack>/Steps/Training
+          default: "FALSE"
+        - name: run_inference        # /mlpipeline/<stack>/Steps/Inference
+          default: "FALSE"
+        - name: use_weather          # /mlpipeline/<stack>/ML/UseWeather (passed through, unused as in the Glue jobs)
+          default: "FALSE"
+        - name: forecast_period      # /mlpipeline/<stack>/Forecast/ForecastPeriod (days)
+          default: "7"
+        - name: training_time_frame  # /mlpipeline/<stack>/Forecast/TrainingTimeFrame (days)
+          default: "395"
+        - name: model_name           # /mlpipeline/<stack>/Forecast/ModelName -> UC model <catalog>.gold.<model_name>
+          default: mda_forecast
+        - name: model_alias          # /mlpipeline/<stack>/Forecast/EndpointName -> UC model alias
+          default: champion
+        - name: experiment_path
+          default: /Shared/mda/mda_forecast
+        - name: holidays_country
+          default: US
+        - name: reference_time       # Volt-VAR reference time; empty = latest vltg reading
+          default: ""
+        - name: use_autoloader
+          default: "TRUE"
+
+      job_clusters:
+        - job_cluster_key: etl_cluster
+          new_cluster:
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.node_type_id}
+            data_security_mode: SINGLE_USER
+            autoscale:
+              min_workers: 1
+              max_workers: 4
+        - job_cluster_key: ml_cluster
+          new_cluster:
+            spark_version: ${var.ml_spark_version}
+            node_type_id: ${var.node_type_id}
+            data_security_mode: SINGLE_USER
+            autoscale:
+              min_workers: 1
+              max_workers: 4
+
+      tasks:
+        # ---- roots: run in parallel ----------------------------------------------------
+        - task_key: ingest_bronze
+          description: Auto Loader landing volume -> bronze (Firehose + SQS + staging Glue)
+          job_cluster_key: etl_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/ingest_bronze.py
+          max_retries: 1
+
+        - task_key: ingest_topology
+          description: Grid topology JSON -> bronze/silver reference tables (topology_transformer Lambda)
+          job_cluster_key: etl_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/ingest_topology.py
+
+        # ---- silver ---------------------------------------------------------------------
+        - task_key: silver_transform
+          description: Typed + deduplicated readings with expectations/quarantine (Glue staging -> integrated)
+          depends_on:
+            - task_key: ingest_bronze
+          job_cluster_key: etl_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/silver_transform.py
+
+        # ---- fan-out after silver ---------------------------------------------------------
+        - task_key: check_run_anomaly
+          depends_on:
+            - task_key: silver_transform
+          condition_task:
+            op: EQUAL_TO
+            left: "{{job.parameters.run_anomaly}}"
+            right: "TRUE"
+
+        - task_key: anomaly_detection
+          description: Prophet anomaly detection (mlpipeline-anomaly-detection-job.py)
+          depends_on:
+            - task_key: check_run_anomaly
+              outcome: "true"
+          job_cluster_key: ml_cluster
+          libraries:
+            - pypi:
+                package: prophet>=1.1.5
+          notebook_task:
+            notebook_path: ../src/notebooks/anomaly_detection.py
+            base_parameters:
+              run_id: "{{job.run_id}}"
+
+        - task_key: voltvar_feature
+          description: Volt-VAR CVR savings on SQL warehouse (Athena/PyAthena + SQS + DynamoDB)
+          depends_on:
+            - task_key: silver_transform
+            - task_key: ingest_topology
+          notebook_task:
+            notebook_path: ../src/notebooks/voltvar_feature.sql
+            warehouse_id: ${var.warehouse_id}
+            base_parameters:
+              run_id: "{{job.run_id}}"
+              # constants hard-coded in feature_volt_var_calculator (TODO externalize) -> task parameters
+              default_set_point: "220.0"
+              cvr: "0.8"
+              energy_purchase_price: "0.11"
+              electricity_rate: "11"
+              num_cust: "1000"
+              carbon_savings_per_mwh: "900.0"
+              mw_level: "1"
+
+        - task_key: gold_aggregates
+          description: Hourly/daily consumption and transformer aggregates
+          depends_on:
+            - task_key: silver_transform
+            - task_key: ingest_topology
+          job_cluster_key: etl_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/gold_aggregates.py
+
+        # ---- fan-in: training -------------------------------------------------------------
+        - task_key: check_run_training
+          depends_on:
+            - task_key: gold_aggregates
+          condition_task:
+            op: EQUAL_TO
+            left: "{{job.parameters.run_training}}"
+            right: "TRUE"
+
+        - task_key: ml_training
+          description: Forecast model training + MLflow + UC registry (SageMaker DeepAR + training state machine)
+          depends_on:
+            - task_key: check_run_training
+              outcome: "true"
+          job_cluster_key: ml_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/ml_training.py
+            base_parameters:
+              run_id: "{{job.run_id}}"
+
+        # ---- inference: runs after training, or directly when training is skipped ----------
+        - task_key: check_run_inference
+          depends_on:
+            - task_key: gold_aggregates
+            - task_key: ml_training
+          run_if: NONE_FAILED
+          condition_task:
+            op: EQUAL_TO
+            left: "{{job.parameters.run_inference}}"
+            right: "TRUE"
+
+        - task_key: batch_inference
+          description: PrepareInference + Batch Transform + StoreResults with the UC champion model
+          depends_on:
+            - task_key: check_run_inference
+              outcome: "true"
+          job_cluster_key: ml_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/batch_inference.py
+            base_parameters:
+              run_id: "{{job.run_id}}"
